@@ -440,6 +440,7 @@ def train(args):
     # Resume from a snapshot
     if args.resume:
         chainer.serializers.load_npz(args.resume, trainer)
+        model = trainer.updater.model
 
     # set up validation iterator
     valid = make_batchset(valid_json, args.batch_size,

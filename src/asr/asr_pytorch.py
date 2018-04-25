@@ -223,6 +223,7 @@ def train(args):
     if args.resume:
         chainer.serializers.load_npz(args.resume, trainer)
         model = trainer.updater.model
+        model.load_state_dict(torch.load(args.outdir + '/model.acc.best'))
 
     # Evaluate the model with the test dataset for each epoch
     trainer.extend(PytorchSeqEvaluaterKaldi(
