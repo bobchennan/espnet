@@ -97,6 +97,35 @@ class Reporter(chainer.Chain):
         reporter.report({'loss': mtl_loss}, self)
 
 
+class LDE_clf(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, steps=1):
+        super(LDE_clf, self).__init__()
+        self.D = output_dim
+        self.fc1 = torch.nn.Linear(input_dim, output_dim) # classifier
+        self.fc2 = torch.nn.Parameter(torch.zeros(self.D, input_dim)) # mu
+        torch.nn.init.orthogonal_(self.fc2.data)
+        self.fc3 = torch.nn.Linear(input_dim * self.D, hidden_dim) # iv extractor 1
+        self.fc4 = torch.nn.Linear(hidden_dim, hidden_dim) # iv extractor 2
+        self.fc5 = torch.nn.Linear(hidden_dim, input_dim * self.D) # delta weight
+        self.steps = steps
+
+    def forward(self, x):
+        fc1_w = self.fc1.weight
+        fc1_b = self.fc1.bias
+        bat = x.size(0)
+        dur = x.size(1)
+        w = F.softmax(F.linear(x, fc1_w, fc1_b), dim=-1)
+
+        for _ in xrange(self.steps):
+            r = x.contiguous().view(bat, dur, 1, -1) - self.fc2.view(1, 1, self.D, -1)
+            y = torch.sum(w.view(bat, dur, self.D, 1) * r, dim = 1)
+            y = y.view(bat, -1)
+            y = self.fc4(F.relu(self.fc3(y))) # iv
+            fc1_w = fc1_w.view(1, -1, self.D) + self.fc5(y).view(bat, -1, self.D)
+            w = F.softmax(torch.einsum("ijk,ikl->ijl", (x, fc1_w))+fc1_b, dim=-1)
+        return w
+
+
 # TODO(watanabe) merge Loss and E2E: there is no need to make these separately
 class Loss(torch.nn.Module):
     def __init__(self, predictor, mtlalpha):
@@ -1582,7 +1611,8 @@ class Decoder(torch.nn.Module):
         for l in six.moves.range(1, self.dlayers):
             self.decoder += [torch.nn.LSTMCell(dunits, dunits)]
         self.ignore_id = 0  # NOTE: 0 for CTC?
-        self.output = torch.nn.Linear(dunits, odim)
+        #self.output = torch.nn.Linear(dunits, odim)
+        self.output = LDE_clf(dunits, odim, dunits)
 
         self.loss = None
         self.att = att
