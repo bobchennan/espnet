@@ -114,15 +114,17 @@ class LDE_clf(torch.nn.Module):
         fc1_b = self.fc1.bias
         bat = x.size(0)
         dur = x.size(1)
-        w = F.softmax(F.linear(x, fc1_w, fc1_b), dim=-1)
+        w = F.softmax(F.linear(x, fc1_w, fc1_b), dim=-1) if self.steps > 0 else F.linear(x, fc1_w, fc1_b)
 
-        for _ in xrange(self.steps):
+        for idx in xrange(self.steps):
             r = x.contiguous().view(bat, dur, 1, -1) - self.fc2.view(1, 1, self.D, -1)
             y = torch.sum(w.view(bat, dur, self.D, 1) * r, dim = 1)
             y = y.view(bat, -1)
             y = self.fc4(F.relu(self.fc3(y))) # iv
             fc1_w = fc1_w.view(1, -1, self.D) + self.fc5(y).view(bat, -1, self.D)
-            w = F.softmax(torch.einsum("ijk,ikl->ijl", (x, fc1_w))+fc1_b, dim=-1)
+            w = torch.einsum("ijk,ikl->ijl", (x, fc1_w)) + fc1_b
+            if idx != self.steps-1:
+                w = F.softmax(w, dim = -1)
         return w
 
 
