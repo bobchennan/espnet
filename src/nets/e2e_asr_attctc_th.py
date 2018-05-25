@@ -103,13 +103,13 @@ class LDE_clf(torch.nn.Module):
         self.D = output_dim
         self.fc1 = torch.nn.Linear(input_dim, output_dim) # classifier
         self.fc2 = torch.nn.Parameter(torch.zeros(self.D, input_dim)) # mu
-        torch.nn.init.orthogonal_(self.fc2.data)
+        torch.nn.init.orthogonal(self.fc2.data)
         self.fc3 = torch.nn.Linear(input_dim * self.D, hidden_dim) # iv extractor 1
         self.fc4 = torch.nn.Linear(hidden_dim, hidden_dim) # iv extractor 2
         self.fc5 = torch.nn.Linear(hidden_dim, input_dim * self.D) # delta weight
         self.steps = steps
 
-    def forward(self, x):
+    def forward(self, x, mask):
         fc1_w = self.fc1.weight
         fc1_b = self.fc1.bias
         bat = x.size(0)
@@ -118,11 +118,13 @@ class LDE_clf(torch.nn.Module):
 
         for idx in xrange(self.steps):
             r = x.contiguous().view(bat, dur, 1, -1) - self.fc2.view(1, 1, self.D, -1)
+            w = w * mask.view(bat, dur, 1).type_as(w)
+            w = w / torch.sum(w, dim = 1, keepdim = True)
             y = torch.sum(w.view(bat, dur, self.D, 1) * r, dim = 1)
             y = y.view(bat, -1)
             y = self.fc4(F.relu(self.fc3(y))) # iv
             fc1_w = fc1_w.view(1, -1, self.D) + self.fc5(y).view(bat, -1, self.D)
-            w = torch.einsum("ijk,ikl->ijl", (x, fc1_w)) + fc1_b
+            w = torch.matmul(x, fc1_w) + fc1_b
             if idx != self.steps-1:
                 w = F.softmax(w, dim = -1)
         return w
@@ -175,6 +177,16 @@ def pad_list(xs, pad_value=float("nan")):
     pad = Variable(xs[0].data.new(n_batch, max_len, * xs[0].size()[1:]).zero_() + pad_value)
     for i in range(n_batch):
         pad[i, :xs[i].size(0)] = xs[i]
+    return pad
+
+
+def pad_list_mask(xs):
+    assert isinstance(xs[0], Variable)
+    n_batch = len(xs)
+    max_len = max(x.size(0) for x in xs)
+    pad = Variable(xs[0].data.new(n_batch, max_len).zero_())
+    for i in range(n_batch):
+        pad[i, :xs[i].size(0)] = 1
     return pad
 
 
@@ -1614,7 +1626,7 @@ class Decoder(torch.nn.Module):
             self.decoder += [torch.nn.LSTMCell(dunits, dunits)]
         self.ignore_id = 0  # NOTE: 0 for CTC?
         #self.output = torch.nn.Linear(dunits, odim)
-        self.output = LDE_clf(dunits, odim, dunits)
+        self.output = LDE_clf(dunits, dunits, odim)
 
         self.loss = None
         self.att = att
@@ -1650,6 +1662,7 @@ class Decoder(torch.nn.Module):
         # pys: utt x olen
         pad_ys_in = pad_list(ys_in, self.eos)
         pad_ys_out = pad_list(ys_out, self.ignore_id)
+        pad_ys_out_mask = pad_list_mask(ys_out)
 
         # get dim, length info
         batch = pad_ys_out.size(0)
@@ -1680,9 +1693,9 @@ class Decoder(torch.nn.Module):
                     z_list[l - 1], (z_list[l], c_list[l]))
             z_all.append(z_list[-1])
 
-        z_all = torch.stack(z_all, dim=1).view(batch * olength, self.dunits)
+        z_all = torch.stack(z_all, dim=1) #.view(batch * olength, self.dunits)
         # compute loss
-        y_all = self.output(z_all)
+        y_all = self.output(z_all, pad_ys_out_mask).view(batch * olength, -1)
         self.loss = F.cross_entropy(y_all, pad_ys_out.view(-1),
                                     ignore_index=self.ignore_id,
                                     size_average=True)
