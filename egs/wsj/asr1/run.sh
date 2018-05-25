@@ -8,7 +8,7 @@
 
 # general configuration
 backend=pytorch
-stage=4        # start from 0 if you need to start from data preparation
+stage=5        # start from 0 if you need to start from data preparation
 gpu=            # will be deprecated, please use ngpu
 ngpu=1          # number of gpus ("0" uses cpu, otherwise use gpu)
 debugmode=1
@@ -255,7 +255,7 @@ fi
 
 if [ ${stage} -le 5 ]; then
     echo "stage 5: Decoding"
-    nj=32
+    nj=1
 
     for rtask in ${recog_set}; do
     (

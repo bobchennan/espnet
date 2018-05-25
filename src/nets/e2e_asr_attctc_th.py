@@ -129,6 +129,40 @@ class LDE_clf(torch.nn.Module):
                 w = F.softmax(w, dim = -1)
         return w
 
+    def reset(self):
+        self.x_acc = None 
+        self.fc1_w = None 
+
+    def recognize1(self, x):
+        x = torch.unsqueeze(x, 1)
+        if self.x_acc is None:
+            self.x_acc = x
+        else:
+            self.x_acc = torch.cat((self.x_acc, x), dim=1)
+        #return self.forward(self.x_acc, Variable(torch.ones((self.x_acc.size(0), self.x_acc.size(1)))))[:,-1,:]
+        return self.fc1(x)
+
+    def summary(self):
+        w = F.softmax(F.linear(self.x_acc, fc1_w, fc1_b), dim=-1)
+        r = self.x_acc.contiguous().view(bat, dur, 1, -1) - self.fc2.view(1, 1, self.D, -1)
+        w = w * mask.view(bat, dur, 1).type_as(w)
+        w = w / torch.sum(w, dim = 1, keepdim = True)
+        y = torch.sum(w.view(bat, dur, self.D, 1) * r, dim = 1) 
+        y = y.view(bat, -1)
+        y = self.fc4(F.relu(self.fc3(y))) # iv 
+        self.fc1_w = fc1_w.view(1, -1, self.D) + self.fc5(y).view(bat, -1, self.D)
+
+    def recognize2(self, x):
+        return torch.matmul(x, self.fc1_w) + self.fc1.bias
+
+    def recognize(self, x):
+        x = torch.unsqueeze(x, 1)
+        if self.x_acc is None:
+            self.x_acc = x
+        else:
+            self.x_acc = torch.cat((self.x_acc, x), dim=1)
+        return self.forward(self.x_acc, Variable(torch.ones((self.x_acc.size(0), self.x_acc.size(1)))))[:,-1,:]
+
 
 # TODO(watanabe) merge Loss and E2E: there is no need to make these separately
 class Loss(torch.nn.Module):
@@ -1729,6 +1763,12 @@ class Decoder(torch.nn.Module):
         return self.loss, acc
 
     def recognize_beam(self, h, lpz, recog_args, char_list, rnnlm=None):
+        self.output.reset()
+        self.recognize_beam2(h, lpz, recog_args, char_list, stage=1, rnnlm=rnnlm)
+        self.output.summary()
+        return self.recognize_beam2(h, lpz, recog_args, char_list, stage=2, rnnlm=rnnlm)
+
+    def recognize_beam2(self, h, lpz, recog_args, char_list, stage, rnnlm=None):
         '''beam search implementation
 
         :param Variable h:
@@ -1778,6 +1818,7 @@ class Decoder(torch.nn.Module):
                 ctc_beam = min(lpz.shape[-1], int(beam * CTC_SCORING_RATIO))
             else:
                 ctc_beam = lpz.shape[-1]
+
         hyps = [hyp]
         ended_hyps = []
 
@@ -1798,7 +1839,10 @@ class Decoder(torch.nn.Module):
                         z_list[l - 1], (hyp['z_prev'][l], hyp['c_prev'][l]))
 
                 # get nbest local scores and their ids
-                local_att_scores = F.log_softmax(self.output(z_list[-1]), dim=1).data
+                if stage ==1 :
+                    local_att_scores = F.log_softmax(self.output.recognize1(z_list[-1]), dim=1).data
+                else:
+                    local_att_scores = F.log_softmax(self.output.recognize2(z_list[-1]), dim=1).data
                 if rnnlm:
                     rnnlm_state, z_rnnlm = rnnlm.predictor(hyp['rnnlm_prev'], vy)
                     local_lm_scores = F.log_softmax(z_rnnlm, dim=1).data
