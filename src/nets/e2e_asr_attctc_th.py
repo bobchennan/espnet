@@ -134,18 +134,21 @@ class LDE_clf(torch.nn.Module):
         self.fc1_w = None 
 
     def recognize1(self, x):
-        x = torch.unsqueeze(x, 1)
         if self.x_acc is None:
-            self.x_acc = x
+            self.x_acc = torch.unsqueeze(x, 1)
         else:
-            self.x_acc = torch.cat((self.x_acc, x), dim=1)
+            self.x_acc = torch.cat((self.x_acc, torch.unsqueeze(x, 1)), dim=1)
         #return self.forward(self.x_acc, Variable(torch.ones((self.x_acc.size(0), self.x_acc.size(1)))))[:,-1,:]
         return self.fc1(x)
 
     def summary(self):
+        logging.info('this layer assumes batch size=1')
+        fc1_w = self.fc1.weight
+        fc1_b = self.fc1.bias
+        bat = self.x_acc.size(0)
+        dur = self.x_acc.size(1)
         w = F.softmax(F.linear(self.x_acc, fc1_w, fc1_b), dim=-1)
         r = self.x_acc.contiguous().view(bat, dur, 1, -1) - self.fc2.view(1, 1, self.D, -1)
-        w = w * mask.view(bat, dur, 1).type_as(w)
         w = w / torch.sum(w, dim = 1, keepdim = True)
         y = torch.sum(w.view(bat, dur, self.D, 1) * r, dim = 1) 
         y = y.view(bat, -1)
@@ -153,7 +156,7 @@ class LDE_clf(torch.nn.Module):
         self.fc1_w = fc1_w.view(1, -1, self.D) + self.fc5(y).view(bat, -1, self.D)
 
     def recognize2(self, x):
-        return torch.matmul(x, self.fc1_w) + self.fc1.bias
+        return torch.matmul(x, self.fc1_w).view(x.size(0), self.fc1_w.size(-1)) + self.fc1.bias
 
     def recognize(self, x):
         x = torch.unsqueeze(x, 1)
@@ -1818,7 +1821,6 @@ class Decoder(torch.nn.Module):
                 ctc_beam = min(lpz.shape[-1], int(beam * CTC_SCORING_RATIO))
             else:
                 ctc_beam = lpz.shape[-1]
-
         hyps = [hyp]
         ended_hyps = []
 
