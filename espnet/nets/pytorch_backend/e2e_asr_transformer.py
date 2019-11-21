@@ -8,6 +8,7 @@ from distutils.util import strtobool
 
 import logging
 import math
+import numpy as np
 
 import torch
 
@@ -18,6 +19,7 @@ from espnet.nets.pytorch_backend.e2e_asr import Reporter
 from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet.nets.pytorch_backend.nets_utils import th_accuracy
 from espnet.nets.pytorch_backend.transformer.add_sos_eos import add_sos_eos
+from espnet.nets.pytorch_backend.transformer.add_sos_eos import mask_predict
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder import Decoder
 from espnet.nets.pytorch_backend.transformer.encoder import Encoder
@@ -76,6 +78,8 @@ class E2E(ASRInterface, torch.nn.Module):
                            help='Number of decoder layers')
         group.add_argument('--dunits', default=320, type=int,
                            help='Number of decoder hidden units')
+        group.add_argument('--fast', default=False, type=strtobool,
+                           help='Using fast non-autoregressive model')
         return parser
 
     @property
@@ -114,8 +118,13 @@ class E2E(ASRInterface, torch.nn.Module):
             self_attention_dropout_rate=args.transformer_attn_dropout_rate,
             src_attention_dropout_rate=args.transformer_attn_dropout_rate
         )
-        self.sos = odim - 1
-        self.eos = odim - 1
+        if 'fast' in args and args.fast:
+            self.mask = odim - 1
+            self.sos = odim - 2
+            self.eos = odim - 2
+        else:
+            self.sos = odim - 1
+            self.eos = odim - 1
         self.odim = odim
         self.ignore_id = ignore_id
         self.subsample = [1]
@@ -141,6 +150,7 @@ class E2E(ASRInterface, torch.nn.Module):
         else:
             self.error_calculator = None
         self.rnnlm = None
+        self.fast = args.fast if 'fast' in args else False
 
     def reset_parameters(self, args):
         # initialize parameters
@@ -163,19 +173,7 @@ class E2E(ASRInterface, torch.nn.Module):
         xs_pad = xs_pad[:, :max(ilens)]  # for data parallel
         src_mask = (~make_pad_mask(ilens.tolist())).to(xs_pad.device).unsqueeze(-2)
         hs_pad, hs_mask = self.encoder(xs_pad, src_mask)
-        self.hs_pad = hs_pad
-
-        # 2. forward decoder
-        ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
-        ys_mask = target_mask(ys_in_pad, self.ignore_id)
-        pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
-        self.pred_pad = pred_pad
-
-        # 3. compute attention loss
-        loss_att = self.criterion(pred_pad, ys_out_pad)
-        self.acc = th_accuracy(pred_pad.view(-1, self.odim), ys_out_pad,
-                               ignore_label=self.ignore_id)
-
+        
         # TODO(karita) show predicted text
         # TODO(karita) calculate these stats
         cer_ctc = None
@@ -188,6 +186,23 @@ class E2E(ASRInterface, torch.nn.Module):
             if self.error_calculator is not None:
                 ys_hat = self.ctc.argmax(hs_pad.view(batch_size, -1, self.adim)).data
                 cer_ctc = self.error_calculator(ys_hat.cpu(), ys_pad.cpu(), is_ctc=True)
+        
+        self.hs_pad = hs_pad
+
+        # 2. forward decoder
+        if not self.fast:
+            ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
+        else:
+            ys_in_pad, ys_out_pad = mask_predict(ys_pad, self.mask, self.eos, self.ignore_id, training=self.training)
+        ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.fast)
+        pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+        self.pred_pad = pred_pad
+
+        # 3. compute attention loss
+        loss_att = self.criterion(pred_pad, ys_out_pad)
+        self.acc = th_accuracy(pred_pad.view(-1, self.odim), ys_out_pad,
+                               ignore_label=self.ignore_id)
+
 
         # 5. compute cer/wer
         if self.training or self.error_calculator is None:
@@ -229,19 +244,7 @@ class E2E(ASRInterface, torch.nn.Module):
         enc_output, _ = self.encoder(feat, None)
         return enc_output.squeeze(0)
 
-    def recognize(self, feat, recog_args, char_list=None, rnnlm=None, use_jit=False):
-        """recognize feat.
-
-        :param ndnarray x: input acouctic feature (B, T, D) or (T, D)
-        :param namespace recog_args: argment namespace contraining options
-        :param list char_list: list of characters
-        :param torch.nn.Module rnnlm: language model module
-        :return: N-best decoding results
-        :rtype: list
-
-        TODO(karita): do not recompute previous attention for faster decoding
-        """
-        enc_output = self.encode(feat).unsqueeze(0)
+    def beamsearch(self, enc_output, recog_args, ret=None, char_list=None, rnnlm=None, use_jit=False):
         if recog_args.ctc_weight > 0.0:
             lpz = self.ctc.log_softmax(enc_output)
             lpz = lpz.squeeze(0)
@@ -265,15 +268,21 @@ class E2E(ASRInterface, torch.nn.Module):
         else:
             # maxlen >= 1
             maxlen = max(1, int(recog_args.maxlenratio * h.size(0)))
+        if self.fast and ret is not None:
+            maxlen = min(maxlen, ret.size(1))
         minlen = int(recog_args.minlenratio * h.size(0))
+        if self.fast and ret is not None:
+            minlen = min(minlen, ret.size(1))
         logging.info('max output length: ' + str(maxlen))
         logging.info('min output length: ' + str(minlen))
 
         # initialize hypothesis
         if rnnlm:
-            hyp = {'score': 0.0, 'yseq': [y], 'rnnlm_prev': None}
+            hyp = {'score': 0.0, 'yseq': [y], 'rnnlm_prev': None, 'local_score':[]}
         else:
-            hyp = {'score': 0.0, 'yseq': [y]}
+            hyp = {'score': 0.0, 'yseq': [y], 'local_score':[]}
+
+        start = 0
         if lpz is not None:
             import numpy
 
@@ -299,10 +308,10 @@ class E2E(ASRInterface, torch.nn.Module):
             hyps_best_kept = []
             for hyp in hyps:
                 vy.unsqueeze(1)
-                vy[0] = hyp['yseq'][i]
+                vy[0] = hyp['yseq'][i + start]
 
                 # get nbest local scores and their ids
-                ys_mask = subsequent_mask(i + 1).unsqueeze(0)
+                ys_mask = subsequent_mask(i + start + 1).unsqueeze(0)
                 ys = torch.tensor(hyp['yseq']).unsqueeze(0)
                 # FIXME: jit does not match non-jit result
                 if use_jit:
@@ -310,7 +319,15 @@ class E2E(ASRInterface, torch.nn.Module):
                         traced_decoder = torch.jit.trace(self.decoder.recognize, (ys, ys_mask, enc_output))
                     local_att_scores = traced_decoder(ys, ys_mask, enc_output)
                 else:
-                    local_att_scores = self.decoder.recognize(ys, ys_mask, enc_output)
+                    if self.fast:
+                        if ret is not None:
+                            local_att_scores = ret[:, i]
+                        else:
+                            ys = torch.tensor(hyp['yseq'][1:] + [self.mask]).unsqueeze(0).long()
+                            local_att_scores = self.decoder(ys, ys_mask, enc_output, None)[0] 
+                            local_att_scores = torch.log_softmax(local_att_scores[:, -1, torch.arange(self.odim)!=self.mask], dim=-1)
+                    else:
+                        local_att_scores = self.decoder.recognize(ys, ys_mask, enc_output)
 
                 if rnnlm:
                     rnnlm_state, local_lm_scores = rnnlm.predict(hyp['rnnlm_prev'], vy)
@@ -322,7 +339,7 @@ class E2E(ASRInterface, torch.nn.Module):
                     local_best_scores, local_best_ids = torch.topk(
                         local_att_scores, ctc_beam, dim=1)
                     ctc_scores, ctc_states = ctc_prefix_score(
-                        hyp['yseq'], local_best_ids[0], hyp['ctc_state_prev'])
+                        hyp['yseq'][start:], local_best_ids[0], hyp['ctc_state_prev'])
                     local_scores = \
                         (1.0 - ctc_weight) * local_att_scores[:, local_best_ids[0]] \
                         + ctc_weight * torch.from_numpy(ctc_scores - hyp['ctc_score_prev'])
@@ -344,6 +361,8 @@ class E2E(ASRInterface, torch.nn.Module):
                     if lpz is not None:
                         new_hyp['ctc_state_prev'] = ctc_states[joint_best_ids[0, j]]
                         new_hyp['ctc_score_prev'] = ctc_scores[joint_best_ids[0, j]]
+                    new_hyp['local_score'] = hyp['local_score'][:]
+                    new_hyp['local_score'].append(local_best_scores[0, j].item())
                     # will be (2 x beam) hyps at most
                     hyps_best_kept.append(new_hyp)
 
@@ -355,7 +374,7 @@ class E2E(ASRInterface, torch.nn.Module):
             logging.debug('number of pruned hypothes: ' + str(len(hyps)))
             if char_list is not None:
                 logging.debug(
-                    'best hypo: ' + ''.join([char_list[int(x)] for x in hyps[0]['yseq'][1:]]))
+                    'best hypo: ' + ''.join([char_list[int(x)] for x in hyps[0]['yseq'][start:]]))
 
             # add eos in the final loop to avoid that there are no ended hyps
             if i == maxlen - 1:
@@ -378,6 +397,8 @@ class E2E(ASRInterface, torch.nn.Module):
                         ended_hyps.append(hyp)
                 else:
                     remained_hyps.append(hyp)
+            if len(remained_hyps) == 0:
+                remained_hyps = hyps
 
             # end detection
             from espnet.nets.e2e_asr_common import end_detect
@@ -395,7 +416,7 @@ class E2E(ASRInterface, torch.nn.Module):
             if char_list is not None:
                 for hyp in hyps:
                     logging.debug(
-                        'hypo: ' + ''.join([char_list[int(x)] for x in hyp['yseq'][1:]]))
+                        'hypo: ' + ''.join([char_list[int(x)] for x in hyp['yseq'][start:]]))
 
             logging.debug('number of ended hypothes: ' + str(len(ended_hyps)))
 
@@ -403,16 +424,93 @@ class E2E(ASRInterface, torch.nn.Module):
             ended_hyps, key=lambda x: x['score'], reverse=True)[:min(len(ended_hyps), recog_args.nbest)]
 
         # check number of hypotheis
-        if len(nbest_hyps) == 0:
-            logging.warning('there is no N-best results, perform recognition again with smaller minlenratio.')
-            # should copy becasuse Namespace will be overwritten globally
-            recog_args = Namespace(**vars(recog_args))
-            recog_args.minlenratio = max(0.0, recog_args.minlenratio - 0.1)
-            return self.recognize(feat, recog_args, char_list, rnnlm)
+        #if len(nbest_hyps) == 0:
+        #    logging.warning('there is no N-best results, perform recognition again with smaller minlenratio.')
+        #    # should copy becasuse Namespace will be overwritten globally
+        #    recog_args = Namespace(**vars(recog_args))
+        #    recog_args.minlenratio = max(0.0, recog_args.minlenratio - 0.1)
+        #    return self.recognize(feat, recog_args, char_list, rnnlm)
 
         logging.info('total log probability: ' + str(nbest_hyps[0]['score']))
         logging.info('normalized log probability: ' + str(nbest_hyps[0]['score'] / len(nbest_hyps[0]['yseq'])))
         return nbest_hyps
+
+    def recognize(self, feat, recog_args, char_list=None, rnnlm=None, use_jit=False):
+        """recognize feat.
+
+        :param ndnarray x: input acouctic feature (B, T, D) or (T, D)
+        :param namespace recog_args: argment namespace contraining options
+        :param list char_list: list of characters
+        :param torch.nn.Module rnnlm: language model module
+        :return: N-best decoding results
+        :rtype: list
+
+        TODO(karita): do not recompute previous attention for faster decoding
+        """
+        if self.fast and recog_args.order != 'left_right':
+            xs, ys = feat
+            self.eval()
+
+            length = recog_args.maxlength
+
+            xs_pad = torch.from_numpy(xs[0]).unsqueeze(0)
+            ilens = torch.from_numpy(np.array([xs[0].shape[0]]))
+            ys_in_pad = torch.zeros(1, length, dtype=torch.long) + self.mask
+            ys_in_pad[:, -1] = self.mask
+            xs_mask = (~make_pad_mask(ilens.tolist())).to(xs_pad.device).unsqueeze(-2)
+            hs_pad, hs_mask = self.encoder(xs_pad, xs_mask)
+            div = length // (recog_args.T)
+            
+            pred_pad, pred_mask = self.decoder(ys_in_pad, (ys_in_pad != self.ignore_id).unsqueeze(-2), hs_pad, hs_mask)
+
+            if recog_args.truncate:
+                pos_eos = torch.nonzero(pred_pad[0].argmax(dim=-1) == self.eos)
+                if torch.sum(pos_eos) > 0 and recog_args.T > 1:
+                    length = max(1, min(length, pos_eos[0].item() + 3))
+                    ys_in_pad = ys_in_pad[:, :length]
+                    pred_pad = pred_pad[:, :length]
+
+            ret = torch.zeros(1, length, self.odim - 1)
+            ret[0, :, :] = torch.log_softmax(pred_pad[0, :, torch.arange(self.odim)!=self.mask], dim=-1)
+            logging.info('step {0} {1}: '.format(0, ''.join([char_list[int(x)] for x in ret[0].argmax(dim=-1).numpy().tolist()]).replace('<space>', ' ')))
+            for t in range(1, recog_args.T):
+                #hyps = self.beamsearch(hs_pad, recog_args, ret, char_list, rnnlm, use_jit)
+                #p = torch.tensor(hyps[0]['local_score']).unsqueeze(0)
+                #ass = torch.tensor(hyps[0]['yseq'][1:]).unsqueeze(0)
+                
+                #mask predict
+                if recog_args.order == 'mask_predict':
+                    p, ass = ret.max(dim=-1)
+                    _, idx = torch.topk(p[0], p.size(-1) * (recog_args.T - t) // recog_args.T, largest=False, dim=-1)
+
+                    if ass.size(1) <= ys_in_pad.size(1):
+                        ys_in_pad[:, :ass.size(1)] = ass
+                    else:
+                        ys_in_pad = ass
+                    ys_in_pad[0, idx] = self.mask
+                    logging.info('step {0} {1} input: '.format(t, ''.join([char_list[int(x)] if int(x) != self.mask else '<mask>' for x in ys_in_pad[0].numpy().tolist()]).replace('<space>', ' ')))
+                    pred_pad, pred_mask = self.decoder(ys_in_pad, (ys_in_pad != self.ignore_id).unsqueeze(-2), hs_pad, hs_mask)
+                    
+                    ret[0, idx] = torch.log_softmax(pred_pad[0, idx][:, torch.arange(self.odim)!=self.mask], dim=-1)
+                    logging.info('step {0} {1} result: '.format(t, ''.join([char_list[int(x)] for x in ret[0].argmax(dim=-1).numpy().tolist()]).replace('<space>', ' ')))
+
+                #easy first
+                if recog_args.order == 'easy_first':
+                    p, ass = pred_pad.max(dim=-1)
+                    mask_idx = torch.nonzero(ys_in_pad[0] == self.mask).flatten()
+                    probs, idx = torch.topk(p[0, mask_idx], min((p.size(-1) + recog_args.T - 1) // recog_args.T, mask_idx.size(0)), largest=True, dim=-1, sorted=False)
+                    ys_in_pad[0, mask_idx[idx]] = ass[0, mask_idx[idx]]
+                    ret[0, mask_idx[idx]] = torch.log_softmax(pred_pad[0, mask_idx[idx]][:, torch.arange(self.odim)!=self.mask], dim=-1)
+                    pred_pad, pred_mask = self.decoder(ys_in_pad, (ys_in_pad != self.ignore_id).unsqueeze(-2), hs_pad, hs_mask)
+                    logging.info('step {0}: {1}'.format(t, ''.join([char_list[int(x)] if int(x) != self.mask else '__' for x in ys_in_pad[0].numpy().tolist()]).replace('<space>', ' ')))
+                    logging.info('result {0}: {1}'.format(t, ''.join([char_list[int(x)] for x in ret[0].argmax(dim=-1).numpy().tolist()]).replace('<space>', ' ')))
+
+            return self.beamsearch(hs_pad, recog_args, ret, char_list, rnnlm, use_jit)
+        else:
+            if self.fast:
+                feat = feat[0][0]
+            enc_output = self.encode(feat).unsqueeze(0)
+            return self.beamsearch(enc_output, recog_args, None, char_list, rnnlm, use_jit)
 
     def calculate_all_attentions(self, xs_pad, ilens, ys_pad, ys_pad_asr=None):
         """E2E attention calculation.

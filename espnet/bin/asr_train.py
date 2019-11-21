@@ -333,6 +333,8 @@ def main(cmd_args):
                      for entry in dictionary]
         char_list.insert(0, '<blank>')
         char_list.append('<eos>')
+        if args.fast:
+            char_list.append('<mask>')
         args.char_list = char_list
     else:
         args.char_list = None

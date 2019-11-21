@@ -75,6 +75,43 @@ class PositionalEncoding(torch.nn.Module):
         return self.dropout(x)
 
 
+class ParaPositionalEncoding(torch.nn.Module):
+    """ParaPositional encoding.
+
+    :param int d_model: embedding dim
+    :param float dropout_rate: dropout rate
+
+    """
+
+    def __init__(self, d_model, dropout_rate):
+        """Construct an PositionalEncoding object."""
+        super(ParaPositionalEncoding, self).__init__()
+        self.d_model = d_model
+        self.xscale = math.sqrt(self.d_model)
+        self.dropout = torch.nn.Dropout(p=dropout_rate)
+        self.base_freq = torch.nn.Parameter(torch.ones(1) * math.log(10000.0))
+
+    def forward(self, x: torch.Tensor):
+        """Add positional encoding.
+
+        Args:
+            x (torch.Tensor): Input. Its shape is (batch, time, ...)
+
+        Returns:
+            torch.Tensor: Encoded tensor. Its shape is (batch, time, ...)
+
+        """
+        pe = torch.zeros(x.size(1), self.d_model).to(x)
+        position = torch.arange(0, x.size(1), dtype=torch.float32).unsqueeze(1).to(x)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=torch.float32).to(x) *
+                             -(self.base_freq / self.d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        x = x * self.xscale + pe[:, :x.size(1)]
+        return self.dropout(x)
+
+
 class ScaledPositionalEncoding(PositionalEncoding):
     """Scaled positional encoding module.
 

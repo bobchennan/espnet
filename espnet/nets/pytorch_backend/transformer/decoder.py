@@ -10,7 +10,7 @@ import torch
 
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder_layer import DecoderLayer
-from espnet.nets.pytorch_backend.transformer.embedding import PositionalEncoding
+from espnet.nets.pytorch_backend.transformer.embedding import ParaPositionalEncoding, PositionalEncoding
 from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
 from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
 from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import PositionwiseFeedForward
@@ -48,7 +48,7 @@ class Decoder(ScorerInterface, torch.nn.Module):
                  src_attention_dropout_rate=0.0,
                  input_layer="embed",
                  use_output_layer=True,
-                 pos_enc_class=PositionalEncoding,
+                 pos_enc_class=ParaPositionalEncoding,
                  normalize_before=True,
                  concat_after=False):
         """Construct an Decoder object."""

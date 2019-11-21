@@ -67,6 +67,15 @@ def get_parser():
     parser.add_argument('--num-spkrs', type=int, default=1,
                         choices=[1, 2],
                         help='Number of speakers in the speech')
+    # non-autoregressive
+    parser.add_argument('--order', default='easy_first', choices=['mask_predict', 'easy_first', 'left_right'],
+                        help='check https://arxiv.org/abs/1911.04908')
+    parser.add_argument('--T', type=int, default=1,
+                        help='Number of iterations for non-autoregressive models. Only works for easy_first and mask_predict')
+    parser.add_argument('--maxlength', type=int, default=140,
+                        help='maximum length for non-autoregressive models. CSJ: 140; Aishell: 37')
+    parser.add_argument('--truncate', default=False, type=strtobool,
+                        help='truncate utterance after first iteration to speed up inference')
     # search related
     parser.add_argument('--nbest', type=int, default=1,
                         help='Output N-best hypotheses')

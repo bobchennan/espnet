@@ -292,6 +292,8 @@ def train(args):
     utts = list(valid_json.keys())
     idim = int(valid_json[utts[0]]['input'][0]['shape'][-1])
     odim = int(valid_json[utts[0]]['output'][0]['shape'][-1])
+    if args.fast:
+        odim = odim + 1
     logging.info('#input dims : ' + str(idim))
     logging.info('#output dims: ' + str(odim))
 
@@ -319,7 +321,7 @@ def train(args):
         rnnlm_args = get_model_conf(args.rnnlm, args.rnnlm_conf)
         rnnlm = lm_pytorch.ClassifierWithState(
             lm_pytorch.RNNLM(
-                len(args.char_list), rnnlm_args.layer, rnnlm_args.unit))
+                len(args.char_list) - (1 if model.fast else 0), rnnlm_args.layer, rnnlm_args.unit))
         torch.load(args.rnnlm, rnnlm)
         model.rnnlm = rnnlm
 
@@ -552,6 +554,9 @@ def recog(args):
     assert isinstance(model, ASRInterface)
     model.recog_args = args
 
+    if model.fast:
+        del train_args.char_list[-1]
+
     # read rnnlm
     if args.rnnlm:
         rnnlm_args = get_model_conf(args.rnnlm, args.rnnlm_conf)
@@ -597,7 +602,7 @@ def recog(args):
     new_js = {}
 
     load_inputs_and_targets = LoadInputsAndTargets(
-        mode='asr', load_output=False, sort_in_input_length=False,
+        mode='asr', load_output=False if not model.fast else True, sort_in_input_length=False,
         preprocess_conf=train_args.preprocess_conf
         if args.preprocess_conf is None else args.preprocess_conf,
         preprocess_args={'train': False})
@@ -607,7 +612,10 @@ def recog(args):
             for idx, name in enumerate(js.keys(), 1):
                 logging.info('(%d/%d) decoding ' + name, idx, len(js.keys()))
                 batch = [(name, js[name])]
-                feat = load_inputs_and_targets(batch)[0][0]
+                if not model.fast:
+                    feat = load_inputs_and_targets(batch)[0][0]
+                else:
+                    feat = load_inputs_and_targets(batch)
                 if args.streaming_mode == 'window':
                     logging.info('Using streaming recognizer with window size %d frames', args.streaming_window)
                     se2e = WindowStreamingE2E(e2e=model, recog_args=args, rnnlm=rnnlm)
