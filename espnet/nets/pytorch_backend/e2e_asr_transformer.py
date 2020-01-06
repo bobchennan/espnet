@@ -19,6 +19,7 @@ from espnet.nets.pytorch_backend.e2e_asr import Reporter
 from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet.nets.pytorch_backend.nets_utils import th_accuracy
 from espnet.nets.pytorch_backend.transformer.add_sos_eos import add_sos_eos
+from espnet.nets.pytorch_backend.transformer.add_sos_eos import factorize_predict
 from espnet.nets.pytorch_backend.transformer.add_sos_eos import mask_predict
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder import Decoder
@@ -78,8 +79,10 @@ class E2E(ASRInterface, torch.nn.Module):
                            help='Number of decoder layers')
         group.add_argument('--dunits', default=320, type=int,
                            help='Number of decoder hidden units')
-        group.add_argument('--fast', default=False, type=strtobool,
-                           help='Using fast non-autoregressive model')
+        group.add_argument('--nat', default=False, type=strtobool,
+                           help='Using non-autoregressive model')
+        group.add_argument('--nat_mode', default='CM', type=str, choices=["CM", "FM"],
+                           help='CM: A-CMLM; FM: A-FMLM')
         return parser
 
     @property
@@ -118,7 +121,7 @@ class E2E(ASRInterface, torch.nn.Module):
             self_attention_dropout_rate=args.transformer_attn_dropout_rate,
             src_attention_dropout_rate=args.transformer_attn_dropout_rate
         )
-        if 'fast' in args and args.fast:
+        if 'nat' in args and args.nat:
             self.mask = odim - 1
             self.sos = odim - 2
             self.eos = odim - 2
@@ -150,7 +153,9 @@ class E2E(ASRInterface, torch.nn.Module):
         else:
             self.error_calculator = None
         self.rnnlm = None
-        self.fast = args.fast if 'fast' in args else False
+        self.nat = args.nat if 'nat' in args else False
+        if self.nat:
+            self.nat_mode = args.nat_mode if 'nat_mode' in args else False
 
     def reset_parameters(self, args):
         # initialize parameters
@@ -190,12 +195,24 @@ class E2E(ASRInterface, torch.nn.Module):
         self.hs_pad = hs_pad
 
         # 2. forward decoder
-        if not self.fast:
-            ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
-        else:
-            ys_in_pad, ys_out_pad = mask_predict(ys_pad, self.mask, self.eos, self.ignore_id, training=self.training)
-        ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.fast)
-        pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+        if not self.nat or self.nat_mode == 'CM':
+            if not self.nat:
+                ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
+            elif self.nat_mode == 'CM':
+                ys_in_pad, ys_out_pad = mask_predict(ys_pad, self.mask, self.eos, self.ignore_id, training=self.training)
+            ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+        elif self.nat_mode == 'FM':
+            ys_in_pad, ys_out_pad = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id)
+            ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask, sample=False)
+
+            #second iteration
+            ys_in_pad, (mask1, mask2) = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id, pred_pad)
+            ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+            pred_pad2, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+
+            pred_pad = mask1.unsqueeze(-1).float() * pred_pad + mask2.unsqueeze(-1).float() * pred_pad2
         self.pred_pad = pred_pad
 
         # 3. compute attention loss
@@ -268,10 +285,10 @@ class E2E(ASRInterface, torch.nn.Module):
         else:
             # maxlen >= 1
             maxlen = max(1, int(recog_args.maxlenratio * h.size(0)))
-        if self.fast and ret is not None:
+        if self.nat and ret is not None:
             maxlen = min(maxlen, ret.size(1))
         minlen = int(recog_args.minlenratio * h.size(0))
-        if self.fast and ret is not None:
+        if self.nat and ret is not None:
             minlen = min(minlen, ret.size(1))
         logging.info('max output length: ' + str(maxlen))
         logging.info('min output length: ' + str(minlen))
@@ -319,7 +336,7 @@ class E2E(ASRInterface, torch.nn.Module):
                         traced_decoder = torch.jit.trace(self.decoder.recognize, (ys, ys_mask, enc_output))
                     local_att_scores = traced_decoder(ys, ys_mask, enc_output)
                 else:
-                    if self.fast:
+                    if self.nat:
                         if ret is not None:
                             local_att_scores = ret[:, i]
                         else:
@@ -447,7 +464,7 @@ class E2E(ASRInterface, torch.nn.Module):
 
         TODO(karita): do not recompute previous attention for faster decoding
         """
-        if self.fast and recog_args.order != 'left_right':
+        if self.nat and recog_args.order != 'left_right':
             xs, ys = feat
             self.eval()
 
@@ -507,7 +524,7 @@ class E2E(ASRInterface, torch.nn.Module):
 
             return self.beamsearch(hs_pad, recog_args, ret, char_list, rnnlm, use_jit)
         else:
-            if self.fast:
+            if self.nat:
                 feat = feat[0][0]
             enc_output = self.encode(feat).unsqueeze(0)
             return self.beamsearch(enc_output, recog_args, None, char_list, rnnlm, use_jit)
