@@ -205,7 +205,7 @@ class E2E(ASRInterface, torch.nn.Module):
         elif self.nat_mode == 'FM':
             ys_in_pad, ys_out_pad = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id)
             ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
-            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask, sample=False)
+            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
 
             #second iteration
             ys_in_pad, (mask1, mask2) = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id, pred_pad)
