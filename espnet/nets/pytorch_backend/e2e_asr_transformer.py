@@ -205,7 +205,7 @@ class E2E(ASRInterface, torch.nn.Module):
         elif self.nat_mode == 'FM':
             ys_in_pad, ys_out_pad = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id)
             ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
-            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask, sample=False)
+            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
 
             #second iteration
             ys_in_pad, (mask1, mask2) = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id, pred_pad)
@@ -379,7 +379,7 @@ class E2E(ASRInterface, torch.nn.Module):
                         new_hyp['ctc_state_prev'] = ctc_states[joint_best_ids[0, j]]
                         new_hyp['ctc_score_prev'] = ctc_scores[joint_best_ids[0, j]]
                     new_hyp['local_score'] = hyp['local_score'][:]
-                    new_hyp['local_score'].append(local_best_scores[0, j].item())
+                    new_hyp['local_score'].append(local_best_scores[0, j])#torch.log_softmax(local_best_scores[0]))
                     # will be (2 x beam) hyps at most
                     hyps_best_kept.append(new_hyp)
 
@@ -468,14 +468,14 @@ class E2E(ASRInterface, torch.nn.Module):
             xs, ys = feat
             self.eval()
 
-            length = recog_args.maxlength
-
             xs_pad = torch.from_numpy(xs[0]).unsqueeze(0)
             ilens = torch.from_numpy(np.array([xs[0].shape[0]]))
-            ys_in_pad = torch.zeros(1, length, dtype=torch.long) + self.mask
-            ys_in_pad[:, -1] = self.mask
             xs_mask = (~make_pad_mask(ilens.tolist())).to(xs_pad.device).unsqueeze(-2)
             hs_pad, hs_mask = self.encoder(xs_pad, xs_mask)
+            length = hs_pad.size(1) * 56 // 100 + 2
+
+            ys_in_pad = torch.zeros(1, length, dtype=torch.long) + self.mask
+            ys_in_pad[:, -1] = self.mask
             div = length // (recog_args.T)
             
             pred_pad, pred_mask = self.decoder(ys_in_pad, (ys_in_pad != self.ignore_id).unsqueeze(-2), hs_pad, hs_mask)

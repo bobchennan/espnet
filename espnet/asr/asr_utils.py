@@ -280,6 +280,7 @@ def torch_snapshot(savefun=torch.save,
     @extension.make_extension(trigger=(1, 'epoch'), priority=-100)
     def torch_snapshot(trainer):
         _torch_snapshot_object(trainer, trainer, filename.format(trainer), savefun)
+        _torch_snapshot_object(trainer, trainer, 'snapshot.latest', savefun)
 
     return torch_snapshot
 
@@ -448,6 +449,10 @@ def torch_resume(snapshot_path, trainer):
         trainer (chainer.training.Trainer): Chainer's trainer instance.
 
     """
+    if not os.path.isfile(snapshot_path):
+        print("Cannot find snapshot {0}".format(snapshot_path))
+        print("Training from scratch")
+        return
     # load snapshot
     snapshot_dict = torch.load(snapshot_path, map_location=lambda storage, loc: storage)
 
