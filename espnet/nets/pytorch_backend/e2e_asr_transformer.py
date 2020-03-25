@@ -20,6 +20,7 @@ from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 from espnet.nets.pytorch_backend.nets_utils import th_accuracy
 from espnet.nets.pytorch_backend.transformer.add_sos_eos import add_sos_eos
 from espnet.nets.pytorch_backend.transformer.add_sos_eos import factorize_predict
+from espnet.nets.pytorch_backend.transformer.add_sos_eos import factorize_predict_v2
 from espnet.nets.pytorch_backend.transformer.add_sos_eos import mask_predict
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.decoder import Decoder
@@ -81,7 +82,7 @@ class E2E(ASRInterface, torch.nn.Module):
                            help='Number of decoder hidden units')
         group.add_argument('--nat', default=False, type=strtobool,
                            help='Using non-autoregressive model')
-        group.add_argument('--nat_mode', default='CM', type=str, choices=["CM", "FM"],
+        group.add_argument('--nat_mode', default='CM', type=str, choices=["CM", "FM", "FM_v2"],
                            help='CM: A-CMLM; FM: A-FMLM')
         return parser
 
@@ -202,15 +203,27 @@ class E2E(ASRInterface, torch.nn.Module):
                 ys_in_pad, ys_out_pad = mask_predict(ys_pad, self.mask, self.eos, self.ignore_id, training=self.training)
             ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
             pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
-        elif self.nat_mode == 'FM':
-            ys_in_pad, ys_out_pad = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id)
-            ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
-            pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+        elif self.nat_mode == 'FM' or self.nat_mode == 'FM_v2':
+            if self.nat_mode == 'FM':
+                func = factorize_predict
+                ys_in_pad, ys_out_pad = func(ys_pad, self.mask, self.eos, self.ignore_id)
+                ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+                pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
 
-            #second iteration
-            ys_in_pad, (mask1, mask2) = factorize_predict(ys_pad, self.mask, self.eos, self.ignore_id, pred_pad)
-            ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
-            pred_pad2, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+                #second iteration
+                ys_in_pad, (mask1, mask2) = func(ys_pad, self.mask, self.eos, self.ignore_id, pred_pad)
+                ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+                pred_pad2, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+            else:
+                func = factorize_predict_v2
+                ys_in_pad, ys_out_pad, keep_idx = func(ys_pad, self.mask, self.eos, self.ignore_id)
+                ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+                pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+
+                #second iteration
+                ys_in_pad, (mask1, mask2) = func(ys_pad, self.mask, self.eos, self.ignore_id, pred_pad, keep_idx)
+                ys_mask = target_mask(ys_in_pad, self.ignore_id, use_all=self.nat)
+                pred_pad2, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
 
             pred_pad = mask1.unsqueeze(-1).float() * pred_pad + mask2.unsqueeze(-1).float() * pred_pad2
         self.pred_pad = pred_pad
